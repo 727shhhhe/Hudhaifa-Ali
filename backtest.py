@@ -126,17 +126,32 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
     for i in range(MOM_PERIOD + 2, len(bars)):
         # --- manage an open basket across the bar (open, high, low, close)
         if basket is not None:
-            for price in (o[i], h[i], l[i], c[i]):
+            # adverse extreme first, so a stop and a target inside the same bar
+            # resolve pessimistically
+            adverse = l[i] if basket.direction == BUY else h[i]
+            favorable = h[i] if basket.direction == BUY else l[i]
+
+            for step_index, price in enumerate((o[i], adverse, favorable, c[i])):
                 if basket is None:
                     break
-                bid = price
-                ask = price + spread
+                is_open = step_index == 0
+                long_side = basket.direction == BUY
+                mark = price if long_side else price + spread
 
-                mark = bid if basket.direction == BUY else ask
+                def fill(threshold: float) -> float:
+                    """Fill at the threshold, or at the gapped bar open if worse."""
+                    if not is_open:
+                        return threshold
+                    return min(threshold, mark) if long_side else max(threshold, mark)
+
                 floating = basket.profit(mark, contract_size)
+                vol_value = basket.volume * contract_size
+                avg = basket.avg_price
 
-                if floating <= -HARD_STOP_CASH:
-                    close_basket(mark, t[i], "hard_stop")
+                sl_price = avg - HARD_STOP_CASH / vol_value if long_side \
+                    else avg + HARD_STOP_CASH / vol_value
+                if (mark <= sl_price) if long_side else (mark >= sl_price):
+                    close_basket(fill(sl_price), t[i], "hard_stop")
                     continue
 
                 if floating >= TRAIL_ACTIVATE:
@@ -146,20 +161,17 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
                     close_basket(mark, t[i], "trail_lock")
                     continue
 
-                avg = basket.avg_price
-                if basket.direction == BUY and bid >= avg + TP_POINTS * point:
-                    close_basket(bid, t[i], "take_profit")
-                    continue
-                if basket.direction == SELL and ask <= avg - TP_POINTS * point:
-                    close_basket(ask, t[i], "take_profit")
+                tp_price = avg + TP_POINTS * point if long_side else avg - TP_POINTS * point
+                if (mark >= tp_price) if long_side else (mark <= tp_price):
+                    close_basket(fill(tp_price), t[i], "take_profit")
                     continue
 
                 if basket.count < MAX_POSITIONS:
-                    step = GRID_STEP_POINTS * point
-                    if basket.direction == BUY and ask <= basket.last_price - step:
-                        basket.add(ask, BASE_LOT)
-                    elif basket.direction == SELL and bid >= basket.last_price + step:
-                        basket.add(bid, BASE_LOT)
+                    grid = GRID_STEP_POINTS * point
+                    grid_price = basket.last_price - grid if long_side \
+                        else basket.last_price + grid
+                    if (mark <= grid_price) if long_side else (mark >= grid_price):
+                        basket.add(fill(grid_price), BASE_LOT)
 
         equity_curve.append((t[i], equity))
 
