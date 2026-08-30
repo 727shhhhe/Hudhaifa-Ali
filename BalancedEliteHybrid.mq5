@@ -11,7 +11,7 @@
 input int    mom_period        = 9;      // Momentum baseline period
 input double body_expand_min   = 1.50;   // Candle expansion filter minimum (150%)
 input double body_expand_max   = 4.00;   // Candle expansion filter maximum (400%)
-input double base_lot          = 0.001;  // Nano-lot base size
+input double base_lot          = 0.01;   // Base lot size
 input int    max_positions     = 2;      // Grid recovery cap
 input double grid_step_points  = 12.0;   // Grid increment in points
 input double tp_points         = 22.0;   // Take profit in points from basket average

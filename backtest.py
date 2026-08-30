@@ -20,7 +20,7 @@ import pandas as pd
 MOM_PERIOD = 9
 BODY_EXPAND_MIN = 1.50
 BODY_EXPAND_MAX = 4.00
-BASE_LOT = 0.001
+BASE_LOT = 0.01
 MAX_POSITIONS = 2
 GRID_STEP_POINTS = 12.0
 TP_POINTS = 22.0
@@ -87,7 +87,7 @@ class Basket:
 
 
 def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
-        spread_points: float, commission_per_lot: float):
+        spread_points: float, commission_per_lot: float, lot: float = BASE_LOT):
     spread = spread_points * point
     equity = balance
     basket = None
@@ -171,7 +171,7 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
                     grid_price = basket.last_price - grid if long_side \
                         else basket.last_price + grid
                     if (mark <= grid_price) if long_side else (mark >= grid_price):
-                        basket.add(fill(grid_price), BASE_LOT)
+                        basket.add(fill(grid_price), lot)
 
         equity_curve.append((t[i], equity))
 
@@ -198,9 +198,9 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
 
         entry_bid = o[i + 1]
         if mom > 0 and mom_slope >= 0:
-            basket = Basket(BUY, entry_bid + spread, BASE_LOT)
+            basket = Basket(BUY, entry_bid + spread, lot)
         elif mom < 0 and mom_slope <= 0:
-            basket = Basket(SELL, entry_bid, BASE_LOT)
+            basket = Basket(SELL, entry_bid, lot)
 
     return trades, equity, max_dd, equity_curve
 
@@ -239,6 +239,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--balance", type=float, default=200.0)
+    ap.add_argument("--lot", type=float, default=BASE_LOT)
     ap.add_argument("--point", type=float, default=0.01, help="broker point size (gold 2-digit = 0.01)")
     ap.add_argument("--contract-size", type=float, default=100.0, help="ounces per 1.00 lot")
     ap.add_argument("--spread-points", type=float, default=20.0)
@@ -249,7 +250,7 @@ def main() -> None:
     bars = load_bars(args.csv)
     trades, equity, max_dd, _ = run(
         bars, args.balance, args.point, args.contract_size,
-        args.spread_points, args.commission_per_lot,
+        args.spread_points, args.commission_per_lot, args.lot,
     )
     text, df = report(trades, args.balance, equity, max_dd, bars)
     print(text)
