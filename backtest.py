@@ -57,12 +57,13 @@ def load_bars(path: str) -> pd.DataFrame:
 
 class Basket:
     def __init__(self, direction: int, price: float, volume: float, bar: int = 0,
-                 sl_distance: float = 0.0):
+                 sl_distance: float = 0.0, tp_distance=None):
         self.direction = direction
         self.entries = [(price, volume)]
         self.peak_profit = 0.0
         self.open_bar = bar
         self.sl_distance = sl_distance  # price distance, for non-cash stop modes
+        self.tp_distance = tp_distance  # price distance, None disables the TP
 
     def add(self, price: float, volume: float) -> None:
         self.entries.append((price, volume))
@@ -102,12 +103,23 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
         spread_points: float, commission_per_lot: float, lot: float = BASE_LOT,
         sl_mode: str = "cash", sl_cash: float = HARD_STOP_CASH,
         sl_points: float = 22.0, atr_mult: float = 1.0, atr_period: int = 14,
-        max_hold_bars: int = 0, stop_on_blowup: bool = False):
+        max_hold_bars: int = 0, stop_on_blowup: bool = False,
+        tp_mode: str = "points", tp_points: float = TP_POINTS,
+        tp_atr_mult: float = 1.0, tp_rr: float = 1.0,
+        max_positions: int = MAX_POSITIONS,
+        grid_step_points: float = GRID_STEP_POINTS,
+        trail_activate: float = TRAIL_ACTIVATE,
+        trail_retrace: float = TRAIL_RETRACE):
     """sl_mode: 'cash' (fixed cash cap, as specified), 'points' (price distance
     from the basket average), 'atr' (atr_mult x ATR at entry) or 'none'
-    (TP/trail only). max_hold_bars > 0 adds a time stop."""
+    (TP/trail only). max_hold_bars > 0 adds a time stop.
+
+    tp_mode: 'points' (fixed distance from basket average), 'atr'
+    (tp_atr_mult x ATR at entry), 'rr' (tp_rr x the stop distance) or 'none'
+    (trailing lock / stop only)."""
     spread = spread_points * point
-    atr = atr_series(bars, atr_period).to_numpy() if sl_mode == "atr" else None
+    need_atr = sl_mode == "atr" or tp_mode == "atr"
+    atr = atr_series(bars, atr_period).to_numpy() if need_atr else None
     equity = balance
     basket = None
     trades = []
@@ -185,20 +197,23 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
                         close_basket(fill(sl_price), t[i], "hard_stop")
                         continue
 
-                if floating >= TRAIL_ACTIVATE:
-                    basket.peak_profit = max(basket.peak_profit, floating)
-                if (basket.peak_profit >= TRAIL_ACTIVATE
-                        and basket.peak_profit - floating >= TRAIL_RETRACE):
-                    close_basket(mark, t[i], "trail_lock")
-                    continue
+                if trail_activate > 0:
+                    if floating >= trail_activate:
+                        basket.peak_profit = max(basket.peak_profit, floating)
+                    if (basket.peak_profit >= trail_activate
+                            and basket.peak_profit - floating >= trail_retrace):
+                        close_basket(mark, t[i], "trail_lock")
+                        continue
 
-                tp_price = avg + TP_POINTS * point if long_side else avg - TP_POINTS * point
-                if (mark >= tp_price) if long_side else (mark <= tp_price):
-                    close_basket(fill(tp_price), t[i], "take_profit")
-                    continue
+                if basket.tp_distance is not None:
+                    tp_price = avg + basket.tp_distance if long_side \
+                        else avg - basket.tp_distance
+                    if (mark >= tp_price) if long_side else (mark <= tp_price):
+                        close_basket(fill(tp_price), t[i], "take_profit")
+                        continue
 
-                if basket.count < MAX_POSITIONS:
-                    grid = GRID_STEP_POINTS * point
+                if basket.count < max_positions:
+                    grid = grid_step_points * point
                     grid_price = basket.last_price - grid if long_side \
                         else basket.last_price + grid
                     if (mark <= grid_price) if long_side else (mark >= grid_price):
@@ -252,14 +267,30 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
             sl_distance = atr[i] * atr_mult
             if not (sl_distance > 0):
                 continue
+        elif sl_mode == "cash":
+            # cash stop: distance depends on live basket volume, resolved per tick
+            sl_distance = sl_cash / (lot * contract_size)
         else:
             sl_distance = 0.0
 
+        if tp_mode == "points":
+            tp_distance = tp_points * point
+        elif tp_mode == "atr":
+            tp_distance = atr[i] * tp_atr_mult
+            if not (tp_distance > 0):
+                continue
+        elif tp_mode == "rr":
+            if sl_distance <= 0:
+                continue
+            tp_distance = sl_distance * tp_rr
+        else:
+            tp_distance = None
+
         entry_bid = o[i + 1]
         if mom > 0 and mom_slope >= 0:
-            basket = Basket(BUY, entry_bid + spread, lot, i + 1, sl_distance)
+            basket = Basket(BUY, entry_bid + spread, lot, i + 1, sl_distance, tp_distance)
         elif mom < 0 and mom_slope <= 0:
-            basket = Basket(SELL, entry_bid, lot, i + 1, sl_distance)
+            basket = Basket(SELL, entry_bid, lot, i + 1, sl_distance, tp_distance)
 
     stats = {
         "open_floating": floating if basket is not None else 0.0,
@@ -324,6 +355,14 @@ def main() -> None:
     ap.add_argument("--atr-period", type=int, default=14)
     ap.add_argument("--max-hold-bars", type=int, default=0)
     ap.add_argument("--stop-on-blowup", action="store_true")
+    ap.add_argument("--tp-mode", choices=("points", "atr", "rr", "none"), default="points")
+    ap.add_argument("--tp-points", type=float, default=TP_POINTS)
+    ap.add_argument("--tp-atr-mult", type=float, default=1.0)
+    ap.add_argument("--tp-rr", type=float, default=1.0)
+    ap.add_argument("--max-positions", type=int, default=MAX_POSITIONS)
+    ap.add_argument("--grid-step-points", type=float, default=GRID_STEP_POINTS)
+    ap.add_argument("--trail-activate", type=float, default=TRAIL_ACTIVATE)
+    ap.add_argument("--trail-retrace", type=float, default=TRAIL_RETRACE)
     ap.add_argument("--trades-out", default="trades.csv")
     args = ap.parse_args()
 
@@ -333,6 +372,9 @@ def main() -> None:
         args.spread_points, args.commission_per_lot, args.lot,
         args.sl_mode, args.sl_cash, args.sl_points, args.atr_mult,
         args.atr_period, args.max_hold_bars, args.stop_on_blowup,
+        args.tp_mode, args.tp_points, args.tp_atr_mult, args.tp_rr,
+        args.max_positions, args.grid_step_points,
+        args.trail_activate, args.trail_retrace,
     )
     text, df = report(trades, args.balance, equity, max_dd, bars, stats)
     print(text)
