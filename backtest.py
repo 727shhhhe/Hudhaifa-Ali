@@ -56,10 +56,13 @@ def load_bars(path: str) -> pd.DataFrame:
 
 
 class Basket:
-    def __init__(self, direction: int, price: float, volume: float):
+    def __init__(self, direction: int, price: float, volume: float, bar: int = 0,
+                 sl_distance: float = 0.0):
         self.direction = direction
         self.entries = [(price, volume)]
         self.peak_profit = 0.0
+        self.open_bar = bar
+        self.sl_distance = sl_distance  # price distance, for non-cash stop modes
 
     def add(self, price: float, volume: float) -> None:
         self.entries.append((price, volume))
@@ -86,15 +89,36 @@ class Basket:
         )
 
 
+def atr_series(bars: pd.DataFrame, period: int) -> pd.Series:
+    high, low, close = bars["high"], bars["low"], bars["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+
 def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
-        spread_points: float, commission_per_lot: float, lot: float = BASE_LOT):
+        spread_points: float, commission_per_lot: float, lot: float = BASE_LOT,
+        sl_mode: str = "cash", sl_cash: float = HARD_STOP_CASH,
+        sl_points: float = 22.0, atr_mult: float = 1.0, atr_period: int = 14,
+        max_hold_bars: int = 0, stop_on_blowup: bool = False):
+    """sl_mode: 'cash' (fixed cash cap, as specified), 'points' (price distance
+    from the basket average), 'atr' (atr_mult x ATR at entry) or 'none'
+    (TP/trail only). max_hold_bars > 0 adds a time stop."""
     spread = spread_points * point
+    atr = atr_series(bars, atr_period).to_numpy() if sl_mode == "atr" else None
     equity = balance
     basket = None
     trades = []
     equity_curve = []
     peak_equity = balance
     max_dd = 0.0
+    peak_float_equity = balance
+    max_float_dd = 0.0
+    min_float_equity = balance
+    margin_call_at = None
+    floating = 0.0
 
     def close_basket(price: float, when, reason: str) -> None:
         nonlocal basket, equity, peak_equity, max_dd
@@ -148,11 +172,18 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
                 vol_value = basket.volume * contract_size
                 avg = basket.avg_price
 
-                sl_price = avg - HARD_STOP_CASH / vol_value if long_side \
-                    else avg + HARD_STOP_CASH / vol_value
-                if (mark <= sl_price) if long_side else (mark >= sl_price):
-                    close_basket(fill(sl_price), t[i], "hard_stop")
-                    continue
+                if sl_mode == "cash":
+                    distance = sl_cash / vol_value
+                elif sl_mode == "none":
+                    distance = None
+                else:
+                    distance = basket.sl_distance
+
+                if distance is not None:
+                    sl_price = avg - distance if long_side else avg + distance
+                    if (mark <= sl_price) if long_side else (mark >= sl_price):
+                        close_basket(fill(sl_price), t[i], "hard_stop")
+                        continue
 
                 if floating >= TRAIL_ACTIVATE:
                     basket.peak_profit = max(basket.peak_profit, floating)
@@ -173,7 +204,26 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
                     if (mark <= grid_price) if long_side else (mark >= grid_price):
                         basket.add(fill(grid_price), lot)
 
-        equity_curve.append((t[i], equity))
+            if (basket is not None and max_hold_bars > 0
+                    and i - basket.open_bar >= max_hold_bars):
+                exit_price = c[i] if basket.direction == BUY else c[i] + spread
+                close_basket(exit_price, t[i], "time_stop")
+
+        floating = 0.0
+        if basket is not None:
+            mark_close = c[i] if basket.direction == BUY else c[i] + spread
+            floating = basket.profit(mark_close, contract_size)
+        float_equity = equity + floating
+        peak_float_equity = max(peak_float_equity, float_equity)
+        max_float_dd = max(max_float_dd, peak_float_equity - float_equity)
+        if float_equity < min_float_equity:
+            min_float_equity = float_equity
+        if margin_call_at is None and float_equity <= 0.0:
+            margin_call_at = t[i]
+        equity_curve.append((t[i], equity, float_equity))
+
+        if stop_on_blowup and float_equity <= 0.0:
+            break
 
         if basket is not None:
             continue
@@ -196,23 +246,46 @@ def run(bars: pd.DataFrame, balance: float, point: float, contract_size: float,
         if not (expansion and opposite):
             continue
 
+        if sl_mode == "points":
+            sl_distance = sl_points * point
+        elif sl_mode == "atr":
+            sl_distance = atr[i] * atr_mult
+            if not (sl_distance > 0):
+                continue
+        else:
+            sl_distance = 0.0
+
         entry_bid = o[i + 1]
         if mom > 0 and mom_slope >= 0:
-            basket = Basket(BUY, entry_bid + spread, lot)
+            basket = Basket(BUY, entry_bid + spread, lot, i + 1, sl_distance)
         elif mom < 0 and mom_slope <= 0:
-            basket = Basket(SELL, entry_bid, lot)
+            basket = Basket(SELL, entry_bid, lot, i + 1, sl_distance)
 
-    return trades, equity, max_dd, equity_curve
+    stats = {
+        "open_floating": floating if basket is not None else 0.0,
+        "float_equity": equity + (floating if basket is not None else 0.0),
+        "max_realized_dd": max_dd,
+        "max_float_dd": max_float_dd,
+        "min_float_equity": min_float_equity,
+        "margin_call_at": margin_call_at,
+    }
+    return trades, equity, max_dd, equity_curve, stats
 
 
-def report(trades, start_balance, equity, max_dd, bars):
+def report(trades, start_balance, equity, max_dd, bars, stats=None):
     df = pd.DataFrame(trades)
     lines = []
     lines.append(f"bars:            {len(bars)}  ({bars['datetime'].iloc[0]} -> {bars['datetime'].iloc[-1]})")
     lines.append(f"start balance:   {start_balance:.2f}")
     lines.append(f"end equity:      {equity:.2f}")
     lines.append(f"net profit:      {equity - start_balance:.2f}")
-    lines.append(f"max drawdown:    {max_dd:.2f}")
+    lines.append(f"max drawdown:    {max_dd:.2f}   (realized)")
+    if stats:
+        lines.append(f"open floating:   {stats['open_floating']:.2f}")
+        lines.append(f"equity + float:  {stats['float_equity']:.2f}")
+        lines.append(f"max float DD:    {stats['max_float_dd']:.2f}")
+        lines.append(f"min float equity:{stats['min_float_equity']:.2f}")
+        lines.append(f"margin call:     {stats['margin_call_at']}")
     lines.append(f"baskets closed:  {len(df)}")
     if not df.empty:
         wins = df[df["pnl"] > 0]
@@ -244,15 +317,24 @@ def main() -> None:
     ap.add_argument("--contract-size", type=float, default=100.0, help="ounces per 1.00 lot")
     ap.add_argument("--spread-points", type=float, default=20.0)
     ap.add_argument("--commission-per-lot", type=float, default=0.0)
+    ap.add_argument("--sl-mode", choices=("cash", "points", "atr", "none"), default="cash")
+    ap.add_argument("--sl-cash", type=float, default=HARD_STOP_CASH)
+    ap.add_argument("--sl-points", type=float, default=22.0)
+    ap.add_argument("--atr-mult", type=float, default=1.0)
+    ap.add_argument("--atr-period", type=int, default=14)
+    ap.add_argument("--max-hold-bars", type=int, default=0)
+    ap.add_argument("--stop-on-blowup", action="store_true")
     ap.add_argument("--trades-out", default="trades.csv")
     args = ap.parse_args()
 
     bars = load_bars(args.csv)
-    trades, equity, max_dd, _ = run(
+    trades, equity, max_dd, _, stats = run(
         bars, args.balance, args.point, args.contract_size,
         args.spread_points, args.commission_per_lot, args.lot,
+        args.sl_mode, args.sl_cash, args.sl_points, args.atr_mult,
+        args.atr_period, args.max_hold_bars, args.stop_on_blowup,
     )
-    text, df = report(trades, args.balance, equity, max_dd, bars)
+    text, df = report(trades, args.balance, equity, max_dd, bars, stats)
     print(text)
     if not df.empty:
         df.to_csv(args.trades_out, index=False)
